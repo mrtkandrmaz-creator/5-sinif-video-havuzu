@@ -1,210 +1,197 @@
-import json
+import os
+import tempfile
+import difflib
+import cv2
+import numpy as np
 import streamlit as st
-from youtube_search import YoutubeSearch
-from github import Github, GithubException
+from skimage.metrics import structural_similarity as ssim
+from faster_whisper import WhisperModel
+from moviepy import VideoFileClip, concatenate_videoclips, vfx, afx
 
-# --- SAYFA AYARLARI ---
-st.set_page_config(
-    page_title="5. Sınıf Video Kütüphanesi",
-    page_icon="🎬",
-    layout="wide"
+# Sayfa Ayarları
+st.set_page_config(page_title="Akıllı Ders Videosu Birleştirici", page_icon="🎬", layout="wide")
+
+st.title("🎬 Akıllı Ders Videosu Analiz & Birleştirme Aracı")
+st.markdown("""
+Aynı dersten çekilmiş birden fazla videoyu yükleyin. Yapay zeka **konuşmaları (Whisper)** ve **ekrandaki slaytları (OpenCV)** 
+analiz ederek tekrarlayan anlatımları temizler, en detaylı bölümleri seçer ve yumuşak geçişlerle tek video haline getirir.
+""")
+
+# Yan Menü (Ayarlar)
+with st.sidebar:
+    st.header("⚙️ Analiz Ayarları")
+    model_boyutu = st.selectbox(
+        "Whisper Model Boyutu",
+        options=["tiny", "base", "small", "medium"],
+        index=2,
+        help="Küçük modeller daha hızlıdır, büyük modeller Türkçe kelimeleri daha doğru anlar."
+    )
+    metin_esigi = st.slider("Konuşma Benzerlik Eşiği", 0.40, 0.95, 0.65, 0.05)
+    goruntu_esigi = st.slider("Slayt/Ekran Benzerlik Eşiği", 0.60, 0.98, 0.85, 0.02)
+    gecis_suresi = st.slider("Geçiş (Crossfade) Süresi (sn)", 0.0, 1.0, 0.4, 0.1)
+
+# Model Önbellekleme (Her seferinde tekrar indirmemesi için)
+@st.cache_resource
+def model_yukle(boyut):
+    return WhisperModel(boyut, device="cpu", compute_type="int8")
+
+def kare_al(video_yolu, saniye):
+    cap = cv2.VideoCapture(video_yolu)
+    cap.set(cv2.CAP_PROP_POS_MSEC, saniye * 1000)
+    ret, kare = cap.read()
+    cap.release()
+    if not ret:
+        return None
+    gri = cv2.cvtColor(kare, cv2.COLOR_BGR2GRAY)
+    return cv2.resize(gri, (320, 180))
+
+def goruntu_benzerligi(kare1, kare2):
+    if kare1 is None or kare2 is None:
+        return 0.0
+    skor, _ = ssim(kare1, kare2, full=True)
+    return skor
+
+# Dosya Yükleme Alanı
+yuklenen_dosyalar = st.file_uploader(
+    "Ders videolarını seçin (MP4, MOV, MKV)",
+    type=["mp4", "mov", "mkv"],
+    accept_multiple_files=True
 )
 
-# --- MODERN KART TASARIMI (CSS) ---
-st.markdown("""
-<style>
-    .badge {
-        background-color: #ff4b4b;
-        color: white;
-        padding: 3px 9px;
-        border-radius: 6px;
-        font-size: 12px;
-        font-weight: 600;
-    }
-    .note-box {
-        background-color: rgba(255, 193, 7, 0.12);
-        border-left: 3px solid #ffc107;
-        padding: 8px 12px;
-        border-radius: 4px;
-        font-size: 13px;
-        margin: 8px 0;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# --- 2026-2027 MEB 5. SINIF MÜFREDATI ---
-MUFREDAT = {
-    "Fen Bilimleri": {
-        "1. Gökyüzündeki Komşularımız ve Biz": ["Güneş'in Yapısı ve Dönme Hareketi", "Ay'ın Özellikleri ve Evreleri", "Güneş, Dünya ve Ay Modeli"],
-        "2. Kuvveti Tanıyalım": ["Kuvvetin Ölçülmesi ve Dinamometre", "Kütle ve Ağırlık İlişkisi", "Sürtünme Kuvveti"],
-        "3. Canlıların Yapısına Yolculuk": ["Hücre ve Organelleri", "Bitki ve Hayvan Hücresi Farkları", "Destek ve Hareket Sistemi"],
-        "4. Işığın Dünyası": ["Işığın Yayılması", "Maddenin Işık Geçirgenliği", "Tam Gölgenin Oluşumu"],
-        "5. Maddenin Doğası": ["Maddenin Tanecikli Yapısı", "Isı ve Sıcaklık", "Maddenin Hâl Değişimi", "Isı İletimi ve Yalıtımı"],
-        "6. Yaşamımızdaki Elektrik": ["Devre Elemanlarının Sembolleri", "Ampul Parlaklığını Etkileyen Değişkenler"],
-        "7. Sürdürülebilir Yaşam ve Geri Dönüşüm": ["Evsel Atıklar ve Geri Dönüşüm"]
-    },
-    "Matematik": {
-        "1. Geometrik Şekiller": ["Temel Geometrik Çizimler", "Açı Ölçme", "Çokgenler ve Çember"],
-        "2. Sayılar ve Nicelikler (1)": ["Çok Basamaklı Doğal Sayılar", "Doğal Sayılarla İşlemler ve Problemler"],
-        "3. Geometrik Nicelikler": ["Dikdörtgenin Çevre Uzunluğu", "Dikdörtgenin Alanı"],
-        "4. Sayılar ve Nicelikler (2)": ["Kesirler ve Karşılaştırma", "Ondalık Gösterim", "Yüzdeler"],
-        "5. İstatistiksel Araştırma Süreci": ["Veri Toplama ve Tablolama", "Sütun ve Çizgi Grafikleri"],
-        "6. İşlemlerle Cebirsel Düşünme": ["Eşitliğin Korunumu", "İşlem Önceliği", "Örüntüler ve Algoritma"],
-        "7. Veriden Olasılığa": ["Kesin ve İmkânsız Olaylar", "Olasılık Spektrumu"]
-    }
-}
-
-FILE_PATH = "data/saved_videos.json"
-
-# --- GITHUB İŞLEMLERİ ---
-def get_github_repo():
-    token = st.secrets["GITHUB_TOKEN"]
-    repo_name = st.secrets["GITHUB_REPO"]
-    g = Github(token)
-    return g.get_repo(repo_name)
-
-@st.cache_data(ttl=60)
-def load_saved_videos():
-    try:
-        repo = get_github_repo()
-        contents = repo.get_contents(FILE_PATH)
-        return json.loads(contents.decoded_content.decode("utf-8")), contents.sha
-    except GithubException:
-        return [], None
-    except Exception as e:
-        st.error(f"GitHub bağlantı hatası: {e}")
-        return [], None
-
-def save_video_to_github(video_data):
-    repo = get_github_repo()
-    videos, sha = load_saved_videos()
-    if any(v["id"] == video_data["id"] for v in videos):
-        st.toast("⚠️ Bu video zaten kütüphanede kayıtlı!", icon="ℹ️")
-        return
-
-    videos.append(video_data)
-    updated_content = json.dumps(videos, ensure_ascii=False, indent=2)
-    if sha:
-        repo.update_file(FILE_PATH, f"Video eklendi: {video_data['title'][:30]}", updated_content, sha)
-    else:
-        repo.create_file(FILE_PATH, "İlk video kaydı oluşturuldu", updated_content)
-    st.cache_data.clear()
-    st.toast("✅ Video GitHub deposuna kaydedildi!", icon="🎉")
-
-def delete_video_from_github(video_id):
-    repo = get_github_repo()
-    videos, sha = load_saved_videos()
-    videos = [v for v in videos if v["id"] != video_id]
-    updated_content = json.dumps(videos, ensure_ascii=False, indent=2)
-    repo.update_file(FILE_PATH, f"Video silindi: {video_id}", updated_content, sha)
-    st.cache_data.clear()
-    st.rerun()
-
-def search_youtube(query, max_results=6):
-    try:
-        return YoutubeSearch(query, max_results=max_results).to_dict()
-    except Exception as e:
-        st.error(f"Arama sırasında hata oluştu: {e}")
-        return []
-
-# --- YAN MENÜ ---
-with st.sidebar:
-    st.title("📚 Ders & Konu Seçimi")
-    ders = st.selectbox("Ders", list(MUFREDAT.keys()))
-    unite = st.selectbox("Ünite / Tema", list(MUFREDAT[ders].keys()))
-    konu = st.selectbox("Konu", MUFREDAT[ders][unite])
+if yuklenen_dosyalar:
+    st.info(f"Toplam **{len(yuklenen_dosyalar)}** video yüklendi.")
     
-    st.divider()
-    ekstra_kelime = st.text_input("Arama Filtresi", value="konu anlatımı")
-    sonuc_sayisi = st.slider("Video Sayısı", 4, 12, 6)
-    ara_btn = st.button("🔍 YouTube'da Ara", type="primary", use_container_width=True)
-
-# --- ANA EKRAN ---
-st.title("🎓 5. Sınıf Akıllı Video Havuzu")
-st.caption(f"Aktif Konu: **{ders}** ➔ **{unite}** ➔ **{konu}**")
-
-tab_ara, tab_kayitli = st.tabs(["🔎 Video Ara & Keşfet", "💾 GitHub Video Kütüphanesi"])
-
-# 1. SEKME: YOUTUBE ARAMA & BENZER VİDEO BULMA
-with tab_ara:
-    if ara_btn:
-        sorgu = f"5. sınıf {ders} {konu} {ekstra_kelime}".strip()
-        with st.spinner(f"'{sorgu}' aranıyor..."):
-            st.session_state["search_results"] = search_youtube(sorgu, sonuc_sayisi)
-            st.session_state["active_query"] = sorgu
-            st.session_state["last_meta"] = {"ders": ders, "unite": unite, "konu": konu}
-
-    if "search_results" in st.session_state:
-        results = st.session_state["search_results"]
-        meta = st.session_state.get("last_meta", {"ders": ders, "unite": unite, "konu": konu})
-        st.info(f"Gösterilen arama: **{st.session_state.get('active_query', '')}**")
-
-        if not results:
-            st.warning("Sonuç bulunamadı. Arama filtresini değiştirip tekrar deneyin.")
-        else:
-            cols = st.columns(2)
-            for idx, item in enumerate(results):
-                video_url = f"https://www.youtube.com/watch?v={item['id']}"
-                with cols[idx % 2]:
-                    with st.container(border=True):
-                        st.video(video_url)
-                        st.markdown(f"**{item['title']}**")
-                        st.caption(f"📺 {item['channel']} • ⏱️ {item['duration']} • 👁️ {item['views']}")
-                        
-                        not_metni = st.text_input("Kısa Not (Opsiyonel)", key=f"note_{item['id']}", placeholder="Örn: Sınav öncesi izlenecek...")
-                        
-                        c1, c2 = st.columns(2)
-                        with c1:
-                            if st.button("⭐ Kaydet", key=f"save_{item['id']}", use_container_width=True):
-                                record = {
-                                    "id": item["id"],
-                                    "title": item["title"],
-                                    "channel": item["channel"],
-                                    "duration": item["duration"],
-                                    "url": video_url,
-                                    "ders": meta["ders"],
-                                    "unite": meta["unite"],
-                                    "konu": meta["konu"],
-                                    "not": not_metni
-                                }
-                                save_video_to_github(record)
-                        with c2:
-                            if st.button("🔄 Benzerlerini Bul", key=f"sim_{item['id']}", use_container_width=True):
-                                benzer_sorgu = f"5. sınıf {item['title'][:45]}"
-                                with st.spinner("Benzer videolar getiriliyor..."):
-                                    st.session_state["search_results"] = search_youtube(benzer_sorgu, sonuc_sayisi)
-                                    st.session_state["active_query"] = f"Benzeri: {item['title'][:40]}..."
-                                    st.rerun()
-
-# 2. SEKME: GITHUB KÜTÜPHANESİ
-with tab_kayitli:
-    saved_videos, _ = load_saved_videos()
-    if not saved_videos:
-        st.info("Henüz GitHub deposuna kaydedilmiş video yok. İlk sekmeden video kaydedebilirsiniz.")
-    else:
-        col_f1, col_f2 = st.columns(2)
-        with col_f1:
-            filtre_ders = st.selectbox("Derse Göre Filtrele", ["Tümü"] + list(MUFREDAT.keys()))
-        with col_f2:
-            konular = sorted(list({v["konu"] for v in saved_videos if filtre_ders == "Tümü" or v["ders"] == filtre_ders}))
-            filtre_konu = st.selectbox("Konuya Göre Filtrele", ["Tümü"] + konular)
-
-        filtrelenmis = [
-            v for v in saved_videos
-            if (filtre_ders == "Tümü" or v["ders"] == filtre_ders)
-            and (filtre_konu == "Tümü" or v["konu"] == filtre_konu)
-        ]
-
-        st.write(f"Toplam **{len(filtrelenmis)}** kayıtlı video listeleniyor.")
-        cols = st.columns(2)
-        for idx, vid in enumerate(filtrelenmis):
-            with cols[idx % 2]:
-                with st.container(border=True):
-                    st.markdown(f"<span class='badge'>{vid['ders']}</span> • **{vid['konu']}**", unsafe_allow_html=True)
-                    st.video(vid["url"])
-                    st.markdown(f"**{vid['title']}**")
-                    st.caption(f"📺 {vid['channel']} • ⏱️ {vid['duration']}")
-                    if vid.get("not"):
-                        st.markdown(f"<div class='note-box'>📝 <b>Not:</b> {vid['not']}</div>", unsafe_allow_html=True)
-                    if st.button("🗑️ Kütüphaneden Sil", key=f"del_{vid['id']}", use_container_width=True):
-                        delete_video_from_github(vid["id"])
+    if st.button("🚀 Analiz Et ve Tek Video Oluştur", type="primary"):
+        if len(yuklenen_dosyalar) < 2:
+            st.warning("Karşılaştırma ve birleştirme için en az 2 video yüklemeniz önerilir.")
+        
+        ilerleme_cubugu = st.progress(0)
+        durum_metni = st.empty()
+        
+        with tempfile.TemporaryDirectory() as gecici_dizin:
+            video_yollari = []
+            
+            # 1. Yüklenen videoları geçici klasöre kaydet
+            durum_metni.text("Videolar hazırlanıyor...")
+            for dosya in yuklenen_dosyalar:
+                yol = os.path.join(gecici_dizin, dosya.name)
+                with open(yol, "wb") as f:
+                    f.write(dosya.getbuffer())
+                video_yollari.append(yol)
+            
+            ilerleme_cubugu.progress(15)
+            
+            # 2. Whisper Modelini Yükle ve Ses + Slayt Analizi Yap
+            durum_metni.text(f"Yapay zeka modeli ({model_boyutu}) yükleniyor...")
+            model = model_yukle(model_boyutu)
+            
+            tum_segmentler = []
+            toplam_video = len(video_yollari)
+            
+            for idx, v_yol in enumerate(video_yollari):
+                dosya_adi = os.path.basename(v_yol)
+                durum_metni.text(f"Analiz ediliyor ({idx+1}/{toplam_video}): {dosya_adi}...")
+                
+                segments, _ = model.transcribe(v_yol, language="tr")
+                for seg in segments:
+                    metin = seg.text.strip()
+                    if len(metin) > 3:
+                        orta_sn = (seg.start + seg.end) / 2
+                        kare = kare_al(v_yol, orta_sn)
+                        tum_segmentler.append({
+                            "video": v_yol,
+                            "dosya_adi": dosya_adi,
+                            "baslangic": seg.start,
+                            "bitis": seg.end,
+                            "metin": metin,
+                            "kare": kare
+                        })
+                
+                ilerleme_cubugu.progress(15 + int(45 * ((idx + 1) / toplam_video)))
+            
+            # 3. Benzerlik ve Tekrar Filtreleme
+            durum_metni.text("Tekrarlayan slaytlar ve cümleler ayıklanıyor...")
+            secilen_segmentler = []
+            
+            for aday in tum_segmentler:
+                tekrar_bulundu = False
+                for mevcut in secilen_segmentler:
+                    metin_skoru = difflib.SequenceMatcher(None, aday["metin"].lower(), mevcut["metin"].lower()).ratio()
+                    slayt_skoru = goruntu_benzerligi(aday["kare"], mevcut["kare"])
+                    
+                    ayni_slayt_ve_konu = (slayt_skoru >= goruntu_esigi) and (metin_skoru >= 0.45)
+                    birebir_ayni_cumle = (metin_skoru >= metin_esigi)
+                    
+                    if ayni_slayt_ve_konu or birebir_ayni_cumle:
+                        tekrar_bulundu = True
+                        if len(aday["metin"]) > len(mevcut["metin"]):
+                            mevcut.update(aday)
+                        break
+                
+                if not tekrar_bulundu:
+                    secilen_segmentler.append(aday)
+            
+            ilerleme_cubugu.progress(70)
+            
+            if not secilen_segmentler:
+                st.error("Videolarda birleştirilecek uygun konuşma/görüntü bölümü bulunamadı.")
+                st.stop()
+            
+            # 4. Kesme, Crossfade Uygulama ve Birleştirme
+            durum_metni.text("Seçilen en iyi bölümler geçiş efektleriyle birleştiriliyor (Render)...")
+            acik_videolar = {v: VideoFileClip(v) for v in video_yollari}
+            final_klipler = []
+            
+            for i, seg in enumerate(secilen_segmentler):
+                bas = max(0, seg["baslangic"] - 0.25)
+                bit = min(acik_videolar[seg["video"]].duration, seg["bitis"] + 0.25)
+                klip = acik_videolar[seg["video"]].subclipped(bas, bit)
+                
+                if i > 0 and gecis_suresi > 0:
+                    onceki_seg = secilen_segmentler[i - 1]
+                    farkli_video = (seg["video"] != onceki_seg["video"])
+                    farkli_slayt = (goruntu_benzerligi(seg["kare"], onceki_seg["kare"]) < goruntu_esigi)
+                    
+                    if (farkli_video or farkli_slayt) and klip.duration > (gecis_suresi * 2):
+                        klip = klip.with_effects([
+                            vfx.CrossFadeIn(gecis_suresi),
+                            afx.AudioFadeIn(gecis_suresi)
+                        ])
+                        final_klipler[-1] = final_klipler[-1].with_effects([
+                            afx.AudioFadeOut(gecis_suresi)
+                        ])
+                
+                final_klipler.append(klip)
+            
+            cikti_yolu = os.path.join(gecici_dizin, "birlestirilmis_ders.mp4")
+            final_video = concatenate_videoclips(final_klipler, method="compose")
+            final_video.write_videofile(cikti_yolu, codec="libx264", audio_codec="aac", logger=None)
+            
+            # Bellek temizliği
+            for v in acik_videolar.values():
+                v.close()
+            
+            ilerleme_cubugu.progress(100)
+            durum_metni.text("İşlem tamamlandı!")
+            
+            # Sonuçları Ekranda Göster
+            st.success(f"Toplam **{len(tum_segmentler)}** cümle analiz edildi, tekrarlar elenerek **{len(secilen_segmentler)}** eşsiz bölüm birleştirildi.")
+            
+            col1, col2 = st.columns([2, 1])
+            with col1:
+                st.subheader("🎥 Oluşturulan Ders Videosu")
+                with open(cikti_yolu, "rb") as video_file:
+                    video_bytes = video_file.read()
+                    st.video(video_bytes)
+                    st.download_button(
+                        label="⬇️ Videoyu İndir (MP4)",
+                        data=video_bytes,
+                        file_name="akilli_ders_videosu.mp4",
+                        mime="video/mp4",
+                        type="primary"
+                    )
+            
+            with col2:
+                st.subheader("📋 Kurgu Özeti")
+                for idx, seg in enumerate(secilen_segmentler, 1):
+                    st.markdown(f"**{idx}. [{seg['dosya_adi']}]** ({seg['baslangic']:.1f}s - {seg['bitis']:.1f}s): *{seg['metin']}*")
