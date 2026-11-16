@@ -35,14 +35,20 @@ with st.sidebar:
 def model_yukle(boyut):
     return WhisperModel(boyut, device="cpu", compute_type="int8")
 
-def sesi_wav_olarak_cikar(video_yolu, wav_yolu):
-    """PyAV/Python 3.14 TypeError hatasını önlemek için sesi FFmpeg ile temiz WAV formatına çıkarır."""
+def sesi_numpy_olarak_oku(video_yolu):
+    """
+    PyAV (av.open) hatasını tamamen atlamak için sesi FFmpeg ile 
+    doğrudan 16kHz mono float32 NumPy dizisi olarak okur.
+    """
     komut = [
-        "ffmpeg", "-y", "-i", str(video_yolu),
-        "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
-        str(wav_yolu)
+        "ffmpeg", "-nostdin", "-threads", "0",
+        "-i", str(video_yolu),
+        "-f", "s16le", "-ac", "1", "-acodec", "pcm_s16le", "-ar", "16000",
+        "-"
     ]
-    subprocess.run(komut, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    islem = subprocess.run(komut, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True)
+    ses_dizisi = np.frombuffer(islem.stdout, np.int16).flatten().astype(np.float32) / 32768.0
+    return ses_dizisi
 
 def kare_al(video_yolu, saniye):
     cap = cv2.VideoCapture(str(video_yolu))
@@ -83,8 +89,6 @@ if yuklenen_dosyalar:
             # 1. Yüklenen videoları geçici klasöre kaydet
             durum_metni.text("Videolar hazırlanıyor...")
             for idx, dosya in enumerate(yuklenen_dosyalar):
-                # Türkçe karakter veya boşluk sorunlarını önlemek için güvenli isimlendirme
-                uzanti = os.path.splitext(dosya.name)[1]
                 guvenli_ad = f"video_{idx}_{dosya.name}"
                 yol = os.path.join(gecici_dizin, guvenli_ad)
                 with open(yol, "wb") as f:
@@ -103,15 +107,14 @@ if yuklenen_dosyalar:
             for idx, (v_yol, orijinal_ad) in enumerate(video_yollari):
                 durum_metni.text(f"Analiz ediliyor ({idx+1}/{toplam_video}): {orijinal_ad}...")
                 
-                # Sesi WAV olarak çıkar (av.open TypeError hatasını çözer)
-                wav_yolu = os.path.join(gecici_dizin, f"ses_{idx}.wav")
                 try:
-                    sesi_wav_olarak_cikar(v_yol, wav_yolu)
-                except Exception as e:
+                    ses_verisi = sesi_numpy_olarak_oku(v_yol)
+                except Exception:
                     st.error(f"'{orijinal_ad}' dosyasının sesi okunamadı. Dosyada ses kanalı olduğundan emin olun.")
                     st.stop()
                 
-                segments, _ = model.transcribe(wav_yolu, language="tr")
+                # Dosya yolu yerine doğrudan NumPy dizisi veriliyor (av.open baypas edildi)
+                segments, _ = model.transcribe(ses_verisi, language="tr")
                 for seg in segments:
                     metin = seg.text.strip()
                     if len(metin) > 3:
