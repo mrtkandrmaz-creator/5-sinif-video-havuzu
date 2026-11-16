@@ -1,4 +1,5 @@
 import os
+import subprocess
 import tempfile
 import difflib
 import cv2
@@ -30,13 +31,21 @@ with st.sidebar:
     goruntu_esigi = st.slider("Slayt/Ekran Benzerlik Eşiği", 0.60, 0.98, 0.85, 0.02)
     gecis_suresi = st.slider("Geçiş (Crossfade) Süresi (sn)", 0.0, 1.0, 0.4, 0.1)
 
-# Model Önbellekleme (Her seferinde tekrar indirmemesi için)
 @st.cache_resource
 def model_yukle(boyut):
     return WhisperModel(boyut, device="cpu", compute_type="int8")
 
+def sesi_wav_olarak_cikar(video_yolu, wav_yolu):
+    """PyAV/Python 3.14 TypeError hatasını önlemek için sesi FFmpeg ile temiz WAV formatına çıkarır."""
+    komut = [
+        "ffmpeg", "-y", "-i", str(video_yolu),
+        "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+        str(wav_yolu)
+    ]
+    subprocess.run(komut, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
 def kare_al(video_yolu, saniye):
-    cap = cv2.VideoCapture(video_yolu)
+    cap = cv2.VideoCapture(str(video_yolu))
     cap.set(cv2.CAP_PROP_POS_MSEC, saniye * 1000)
     ret, kare = cap.read()
     cap.release()
@@ -73,11 +82,14 @@ if yuklenen_dosyalar:
             
             # 1. Yüklenen videoları geçici klasöre kaydet
             durum_metni.text("Videolar hazırlanıyor...")
-            for dosya in yuklenen_dosyalar:
-                yol = os.path.join(gecici_dizin, dosya.name)
+            for idx, dosya in enumerate(yuklenen_dosyalar):
+                # Türkçe karakter veya boşluk sorunlarını önlemek için güvenli isimlendirme
+                uzanti = os.path.splitext(dosya.name)[1]
+                guvenli_ad = f"video_{idx}_{dosya.name}"
+                yol = os.path.join(gecici_dizin, guvenli_ad)
                 with open(yol, "wb") as f:
                     f.write(dosya.getbuffer())
-                video_yollari.append(yol)
+                video_yollari.append((yol, dosya.name))
             
             ilerleme_cubugu.progress(15)
             
@@ -88,11 +100,18 @@ if yuklenen_dosyalar:
             tum_segmentler = []
             toplam_video = len(video_yollari)
             
-            for idx, v_yol in enumerate(video_yollari):
-                dosya_adi = os.path.basename(v_yol)
-                durum_metni.text(f"Analiz ediliyor ({idx+1}/{toplam_video}): {dosya_adi}...")
+            for idx, (v_yol, orijinal_ad) in enumerate(video_yollari):
+                durum_metni.text(f"Analiz ediliyor ({idx+1}/{toplam_video}): {orijinal_ad}...")
                 
-                segments, _ = model.transcribe(v_yol, language="tr")
+                # Sesi WAV olarak çıkar (av.open TypeError hatasını çözer)
+                wav_yolu = os.path.join(gecici_dizin, f"ses_{idx}.wav")
+                try:
+                    sesi_wav_olarak_cikar(v_yol, wav_yolu)
+                except Exception as e:
+                    st.error(f"'{orijinal_ad}' dosyasının sesi okunamadı. Dosyada ses kanalı olduğundan emin olun.")
+                    st.stop()
+                
+                segments, _ = model.transcribe(wav_yolu, language="tr")
                 for seg in segments:
                     metin = seg.text.strip()
                     if len(metin) > 3:
@@ -100,7 +119,7 @@ if yuklenen_dosyalar:
                         kare = kare_al(v_yol, orta_sn)
                         tum_segmentler.append({
                             "video": v_yol,
-                            "dosya_adi": dosya_adi,
+                            "dosya_adi": orijinal_ad,
                             "baslangic": seg.start,
                             "bitis": seg.end,
                             "metin": metin,
@@ -139,7 +158,7 @@ if yuklenen_dosyalar:
             
             # 4. Kesme, Crossfade Uygulama ve Birleştirme
             durum_metni.text("Seçilen en iyi bölümler geçiş efektleriyle birleştiriliyor (Render)...")
-            acik_videolar = {v: VideoFileClip(v) for v in video_yollari}
+            acik_videolar = {v_yol: VideoFileClip(v_yol) for v_yol, _ in video_yollari}
             final_klipler = []
             
             for i, seg in enumerate(secilen_segmentler):
